@@ -1,0 +1,95 @@
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# VS Code (keep common shared configs)
+.vscode/*
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+
+# JetBrains
+.idea/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test / type / lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Local secrets / env files ---
+.env
+.env.*
+!.env.example
+
+# --- Logs / temp ---
+*.log
+logs/
+.tmp/
+tmp/
+temp/
+
+# --- Data / artifacts (common for CV/pose projects) ---
+# If you want to version control any of these, remove the rule or add an exception.
+
+# Datasets
+data/
+dataset/
+datasets/
+raw_data/
+processed_data/
+
+# Training/inference outputs
+runs/
+outputs/
+output/
+results/
+checkpoints/
+weights/
+models/
+
+# Large media files (keep your source videos/images out of git by default)
+*.mp4
+*.mov
+*.mkv
+*.avi
+
+# Model files / arrays (often large)
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.h5
+*.keras
+*.npy
+*.npz
+*.pkl
+*.joblib
+
+# --- Misc ---
+*.bak
+*.swp
