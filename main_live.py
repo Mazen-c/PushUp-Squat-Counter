@@ -1,178 +1,202 @@
-"""Live webcam runner for squat counting.
+# main_live.py – Live Exercise Analysis System
+# Run: pip install ultralytics opencv-python
+#      python main_live.py
+# Keys: P = Push-up mode | S = Squat mode | Q = Quit
 
-The analysis modules are pure Python; this runner uses MediaPipe and OpenCV
-when they are available. Keypoints are EMA-smoothed here before any exercise
-logic sees them.
-"""
+import cv2
+import math
+from ultralytics import YOLO
 
-from __future__ import annotations
+# ── Keypoint indices (COCO) ───────────────────────────────────────────────────
 
-import argparse
-import json
-import time
-from pathlib import Path
-from typing import Any, Dict, Mapping, Optional
+LEFT_SHOULDER,  RIGHT_SHOULDER  = 5,  6
+LEFT_ELBOW,     RIGHT_ELBOW     = 7,  8
+LEFT_WRIST,     RIGHT_WRIST     = 9,  10
+LEFT_HIP,       RIGHT_HIP       = 11, 12
+LEFT_ANKLE,     RIGHT_ANKLE     = 15, 16
 
-from pose_utils import normalize_keypoints
-from squat_analysis import SquatAnalyzer
+# ── Push-up thresholds ────────────────────────────────────────────────────────
 
+PUSHUP_EMA_ALPHA       = 0.4
+ELBOW_DOWN_THRESHOLD   = 90    # elbow angle → DOWN state
+ELBOW_UP_THRESHOLD     = 160   # elbow angle → rep complete
+BODY_LINE_MIN_ANGLE    = 160   # below this → bad form
+KEYPOINT_CONF_MIN      = 0.3
 
-class EMAKeypointSmoother:
-    def __init__(self, alpha: float = 0.35) -> None:
-        if not 0.0 < alpha <= 1.0:
-            raise ValueError("alpha must be in the range (0, 1]")
-        self.alpha = alpha
-        self._state: Dict[str, Dict[str, float]] = {}
+# ── Push-up state ─────────────────────────────────────────────────────────────
 
-    def update(self, raw_keypoints: Any) -> Dict[str, Dict[str, float]]:
-        keypoints = normalize_keypoints(raw_keypoints)
-        smoothed: Dict[str, Dict[str, float]] = {}
+_pu_ema            = {}
+_pu_ema_init       = False
+_pu_is_down        = False
+_pu_total_reps     = 0
+_pu_good_reps      = 0
+_pu_cur_rep_good   = True
 
-        for name, point in keypoints.items():
-            previous = self._state.get(name)
-            if previous is None:
-                current = dict(point)
-            else:
-                current = {
-                    "x": self._ema(previous["x"], point["x"]),
-                    "y": self._ema(previous["y"], point["y"]),
-                    "z": self._ema(previous.get("z", 0.0), point.get("z", 0.0)),
-                    "visibility": point.get("visibility", 1.0),
-                }
-            smoothed[name] = current
+_PU_KP_MAP = {
+    "ls": LEFT_SHOULDER,  "rs": RIGHT_SHOULDER,
+    "le": LEFT_ELBOW,     "re": RIGHT_ELBOW,
+    "lw": LEFT_WRIST,     "rw": RIGHT_WRIST,
+    "lh": LEFT_HIP,       "rh": RIGHT_HIP,
+    "la": LEFT_ANKLE,     "ra": RIGHT_ANKLE,
+}
 
-        self._state.update(smoothed)
-        return dict(self._state)
+def _kp(kps, index):
+    x, y, conf = float(kps[index][0]), float(kps[index][1]), float(kps[index][2])
+    return (x, y) if conf >= KEYPOINT_CONF_MIN else (0.0, 0.0)
 
-    def reset(self) -> None:
-        self._state.clear()
+def _ema(prev, new, alpha):
+    return alpha * new + (1.0 - alpha) * prev
 
-    def _ema(self, previous: float, current: float) -> float:
-        return self.alpha * current + (1.0 - self.alpha) * previous
+def _angle(a, b, c):
+    if (0.0, 0.0) in (a, b, c):
+        return 0.0
+    ang = abs(math.degrees(math.atan2(a[1]-b[1], a[0]-b[0]) -
+                            math.atan2(c[1]-b[1], c[0]-b[0])))
+    return 360.0 - ang if ang > 180.0 else ang
 
+def _pt(name):
+    return (_pu_ema[name+"_x"], _pu_ema[name+"_y"])
 
-def build_results_payload(
-    squat_result: Mapping[str, Any],
-    *,
-    timestamp: Optional[float] = None,
-) -> Dict[str, Any]:
-    total_squats = int(squat_result.get("total_squats", 0))
-    good_squats = int(squat_result.get("good_squats", 0))
+def reset_pushup_state():
+    global _pu_ema, _pu_ema_init, _pu_is_down, _pu_total_reps, _pu_good_reps, _pu_cur_rep_good
+    _pu_ema          = {}
+    _pu_ema_init     = False
+    _pu_is_down      = False
+    _pu_total_reps   = 0
+    _pu_good_reps    = 0
+    _pu_cur_rep_good = True
 
-    return {
-        "timestamp": timestamp if timestamp is not None else time.time(),
-        "squats": dict(squat_result),
-        "total_squats": total_squats,
-        "good_squats": good_squats,
-        "MAZEN_TOTAL_SQUATS_VAR": total_squats,
-        "MAZEN_GOOD_SQUATS_VAR": good_squats,
-    }
+def process_pushup_frame(keypoints):
+    global _pu_ema, _pu_ema_init, _pu_is_down, _pu_total_reps, _pu_good_reps, _pu_cur_rep_good
 
+    if keypoints is None:
+        return (_pu_total_reps, _pu_good_reps, True)
 
-def write_results(path: Path, payload: Mapping[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    raw = {k: _kp(keypoints, idx) for k, idx in _PU_KP_MAP.items()}
 
-
-def run_live(args: argparse.Namespace) -> None:
-    try:
-        import cv2
-        import mediapipe as mp
-    except ImportError as exc:
-        raise SystemExit(
-            "main_live.py needs opencv-python and mediapipe for webcam mode. "
-            "Install them, then run again."
-        ) from exc
-
-    mp_pose = None
-    if hasattr(mp, "solutions") and hasattr(mp.solutions, "pose"):
-        mp_pose = mp.solutions.pose
+    if not _pu_ema_init:
+        for k, (x, y) in raw.items():
+            _pu_ema[k+"_x"], _pu_ema[k+"_y"] = x, y
+        _pu_ema_init = True
     else:
-        try:
-            from mediapipe.python.solutions import pose as mp_pose  # type: ignore[assignment]
-        except Exception:
-            import sys
+        for k, (x, y) in raw.items():
+            _pu_ema[k+"_x"] = _ema(_pu_ema[k+"_x"], x, PUSHUP_EMA_ALPHA)
+            _pu_ema[k+"_y"] = _ema(_pu_ema[k+"_y"], y, PUSHUP_EMA_ALPHA)
 
-            raise SystemExit(
-                "MediaPipe was imported, but the legacy Pose API is not available.\n"
-                "Expected either `mediapipe.solutions.pose` or `mediapipe.python.solutions.pose`.\n\n"
-                f"Detected Python: {sys.version.split()[0]}\n"
-                f"Imported mediapipe from: {getattr(mp, '__file__', '<unknown>')}\n\n"
-                "Fix (recommended):\n"
-                "- Use Python 3.10–3.12\n"
-                "- Pin MediaPipe to a build that still bundles `solutions`, e.g. `mediapipe==0.10.14`\n"
-                "- Reinstall: pip install -r requirements.txt\n"
-            )
+    la = _angle(_pt("ls"), _pt("le"), _pt("lw"))
+    ra = _angle(_pt("rs"), _pt("re"), _pt("rw"))
+    elbow_angle = (la + ra) / 2.0 if (la > 0 and ra > 0) else (la or ra)
 
-    source = int(args.source) if str(args.source).isdigit() else args.source
-    capture = cv2.VideoCapture(source)
-    if not capture.isOpened():
-        raise SystemExit(f"Could not open video source: {args.source}")
+    lb = _angle(_pt("ls"), _pt("lh"), _pt("la"))
+    rb = _angle(_pt("rs"), _pt("rh"), _pt("ra"))
+    if lb > 0 and rb > 0:
+        body_line = min(lb, rb)
+    elif lb > 0 or rb > 0:
+        body_line = lb or rb
+    else:
+        body_line = 180.0
 
-    smoother = EMAKeypointSmoother(alpha=args.ema_alpha)
-    squat_analyzer = SquatAnalyzer()
-    output_path = Path(args.output)
+    if 0.0 < body_line < BODY_LINE_MIN_ANGLE:
+        _pu_cur_rep_good = False
 
-    with mp_pose.Pose(
-        model_complexity=1,
-        min_detection_confidence=args.min_detection_confidence,
-        min_tracking_confidence=args.min_tracking_confidence,
-    ) as pose:
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
+    if elbow_angle > 0 and elbow_angle < ELBOW_DOWN_THRESHOLD and not _pu_is_down:
+        _pu_is_down      = True
+        _pu_cur_rep_good = True
 
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = pose.process(rgb_frame)
-            if result.pose_landmarks:
-                raw_keypoints = result.pose_landmarks.landmark
-                smoothed_keypoints = smoother.update(raw_keypoints)
-                squat_result = squat_analyzer.update(smoothed_keypoints)
-            else:
-                squat_result = squat_analyzer.result(feedback="No pose detected")
+    elif elbow_angle > ELBOW_UP_THRESHOLD and _pu_is_down:
+        _pu_is_down     = False
+        _pu_total_reps += 1
+        if _pu_cur_rep_good:
+            _pu_good_reps += 1
 
-            payload = build_results_payload(squat_result)
-            write_results(output_path, payload)
+    return (_pu_total_reps, _pu_good_reps, _pu_cur_rep_good)
 
-            if args.display:
-                _draw_overlay(cv2, frame, payload)
-                cv2.imshow("Exercise counter", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+def process_squat_frame(_keypoints):
+    # Return: (total_reps: int, good_reps: int, is_good_form: bool)
+    return (0, 0, True)
 
-    capture.release()
-    if args.display:
-        cv2.destroyAllWindows()
+# ── Config ────────────────────────────────────────────────────────────────────
 
+INFER_SIZE   = 640          # inference resolution; reduce (e.g. 320) for more speed
+MODE_LABELS  = {'pushup': 'Push-ups', 'squat': 'Squats'}
+KEY_TO_MODE  = {ord('p'): 'pushup', ord('s'): 'squat'}
 
-def _draw_overlay(cv2: Any, frame: Any, payload: Mapping[str, Any]) -> None:
-    lines = [
-        f"Squats: {payload['good_squats']}/{payload['total_squats']}",
-        f"Squat: {payload['squats'].get('feedback', 'Ready')}",
-    ]
-    for index, line in enumerate(lines):
-        cv2.putText(
-            frame,
-            line,
-            (20, 35 + index * 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (40, 255, 40),
-            2,
-            cv2.LINE_AA,
-        )
+# ── Init model & capture ──────────────────────────────────────────────────────
 
+model = YOLO("yolov8s-pose.pt")
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Live squat counter")
-    parser.add_argument("--source", default="0", help="Camera index or video file path")
-    parser.add_argument("--output", default="live_results.json", help="JSON output path")
-    parser.add_argument("--ema-alpha", type=float, default=0.35, help="EMA smoothing alpha")
-    parser.add_argument("--display", action="store_true", help="Show annotated webcam window")
-    parser.add_argument("--min-detection-confidence", type=float, default=0.5)
-    parser.add_argument("--min-tracking-confidence", type=float, default=0.5)
-    return parser.parse_args()
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)    # discard stale frames, minimizes lag
 
+if not cap.isOpened():
+    raise RuntimeError("Webcam not found – check device index in VideoCapture(0)")
 
-if __name__ == "__main__":
-    run_live(parse_args())
+# ── UI helper ─────────────────────────────────────────────────────────────────
+
+def draw_overlay(frame, mode, total_reps, good_reps, good_form):
+    h  = frame.shape[0]
+    pw, ph = 265, 132
+
+    # Semi-transparent dark panel
+    panel = frame.copy()
+    cv2.rectangle(panel, (10, 10), (10 + pw, 10 + ph), (0, 0, 0), -1)
+    cv2.addWeighted(panel, 0.5, frame, 0.5, 0, frame)
+
+    font  = cv2.FONT_HERSHEY_SIMPLEX
+    x, y0 = 18, 38
+    dy    = 28
+
+    cv2.putText(frame, f"Mode : {MODE_LABELS[mode]}",  (x, y0),      font, 0.65, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"Total Reps : {total_reps}",   (x, y0+dy),   font, 0.65, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(frame, f"Good Reps  : {good_reps}",    (x, y0+dy*2), font, 0.65, (255,255,255), 2, cv2.LINE_AA)
+
+    label = "GOOD FORM" if good_form else "BAD FORM"
+    color = (0, 220, 0)  if good_form else (0, 0, 220)
+    cv2.putText(frame, label, (x, y0+dy*3), font, 0.65, color, 2, cv2.LINE_AA)
+
+    cv2.putText(frame, "P=Push-ups  S=Squats  Q=Quit",
+                (10, h - 12), font, 0.42, (160, 160, 160), 1, cv2.LINE_AA)
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
+mode       = 'pushup'
+total_reps = good_reps = 0
+good_form  = True
+
+print("Live analysis running.  P = Push-ups  |  S = Squats  |  Q = Quit")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    results = model(frame, imgsz=INFER_SIZE, verbose=False)
+
+    # Extract keypoints for the first detected person, or None
+    kd        = results[0].keypoints
+    keypoints = kd.data[0].cpu().numpy() if (kd is not None and len(kd.data)) else None
+
+    if mode == 'pushup':
+        total_reps, good_reps, good_form = process_pushup_frame(keypoints)
+    else:
+        total_reps, good_reps, good_form = process_squat_frame(keypoints)
+
+    annotated = results[0].plot()           # draws YOLO skeleton + keypoints
+    draw_overlay(annotated, mode, total_reps, good_reps, good_form)
+
+    cv2.imshow("Live Exercise Analysis", annotated)
+
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        break
+    if key in KEY_TO_MODE and KEY_TO_MODE[key] != mode:
+        mode = KEY_TO_MODE[key]
+        total_reps = good_reps = 0
+        good_form  = True
+        reset_pushup_state()
+        print(f"→ Switched to {MODE_LABELS[mode]} mode")
+
+cap.release()
+cv2.destroyAllWindows()
