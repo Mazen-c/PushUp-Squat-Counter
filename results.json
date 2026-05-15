@@ -1,0 +1,16 @@
+{
+  "video_id": "b10ec861-318d-4c6f-9e1b-a26ed241efca",
+  "timestamp": 1778867881.4506135,
+  "MAZEN_TOTAL_SQUATS_VAR": 3,
+  "MAZEN_GOOD_SQUATS_VAR": 3,
+  "summary": {
+    "squats": {
+      "total_reps": 3,
+      "good_form_reps": 3
+    },
+    "pushups": {
+      "total_reps": 20,
+      "good_form_reps": 1
+    }
+  }
+}
