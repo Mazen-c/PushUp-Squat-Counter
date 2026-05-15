@@ -1,15 +1,15 @@
 {
-  "video_id": "b10ec861-318d-4c6f-9e1b-a26ed241efca",
-  "timestamp": 1778867881.4506135,
-  "MAZEN_TOTAL_SQUATS_VAR": 3,
-  "MAZEN_GOOD_SQUATS_VAR": 3,
+  "video_id": "e3f9025f-1cfe-4430-a145-5bf0553e40a2",
+  "timestamp": 1778868866.5159297,
+  "MAZEN_TOTAL_SQUATS_VAR": 4,
+  "MAZEN_GOOD_SQUATS_VAR": 4,
   "summary": {
     "squats": {
-      "total_reps": 3,
-      "good_form_reps": 3
+      "total_reps": 4,
+      "good_form_reps": 4
     },
     "pushups": {
-      "total_reps": 20,
+      "total_reps": 12,
       "good_form_reps": 1
     }
   }

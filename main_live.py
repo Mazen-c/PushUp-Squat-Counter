@@ -20,11 +20,12 @@ LEFT_ANKLE,     RIGHT_ANKLE     = 15, 16
 
 # ── Push-up thresholds ────────────────────────────────────────────────────────
 
-PUSHUP_EMA_ALPHA       = 0.4
-ELBOW_DOWN_THRESHOLD   = 90    # elbow angle → DOWN state
-ELBOW_UP_THRESHOLD     = 160   # elbow angle → rep complete
-BODY_LINE_MIN_ANGLE    = 160   # below this → bad form
-KEYPOINT_CONF_MIN      = 0.3
+PUSHUP_EMA_ALPHA           = 0.4
+ELBOW_DOWN_THRESHOLD       = 110   # elbow angle → DOWN state (was 90, relaxed for real push-ups)
+ELBOW_UP_THRESHOLD         = 155   # elbow angle → rep complete
+BODY_LINE_MIN_ANGLE        = 145   # below this → bad form (was 160, too strict for horizontal view)
+KEYPOINT_CONF_MIN          = 0.3
+PUSHUP_HORIZONTAL_MAX_DEG  = 45    # torso must be within 45° of horizontal to count reps
 
 SQUAT_EMA_ALPHA        = PUSHUP_EMA_ALPHA
 KNEE_DOWN_THRESHOLD    = 100
@@ -131,6 +132,23 @@ def calculate_angle(a, b, c):
 def _pt(name):
     return (_pu_ema[name+"_x"], _pu_ema[name+"_y"])
 
+def _is_pushup_position():
+    """Return True only when torso is roughly horizontal (person lying down)."""
+    ls, rs = _pt("ls"), _pt("rs")
+    lh, rh = _pt("lh"), _pt("rh")
+    if (0.0, 0.0) in (ls, rs, lh, rh):
+        return True  # missing keypoints — don't block
+    shoulder_x = (ls[0] + rs[0]) / 2
+    shoulder_y = (ls[1] + rs[1]) / 2
+    hip_x      = (lh[0] + rh[0]) / 2
+    hip_y      = (lh[1] + rh[1]) / 2
+    dx = abs(hip_x - shoulder_x)
+    dy = abs(hip_y - shoulder_y)
+    if dx + dy < 1e-6:
+        return True
+    torso_angle = math.degrees(math.atan2(dy, dx))
+    return torso_angle < PUSHUP_HORIZONTAL_MAX_DEG
+
 def reset_pushup_state():
     global _pu_ema, _pu_ema_init, _pu_is_down, _pu_total_reps, _pu_good_reps, _pu_cur_rep_good
     _pu_ema          = {}
@@ -164,20 +182,20 @@ def process_pushup_frame(keypoints):
     lb = calculate_angle(_pt("ls"), _pt("lh"), _pt("la"))
     rb = calculate_angle(_pt("rs"), _pt("rh"), _pt("ra"))
     if lb > 0 and rb > 0:
-        body_line = min(lb, rb)
-    elif lb > 0 or rb > 0:
-        body_line = lb or rb
+        body_line = (lb + rb) / 2.0   # average both sides; more stable than min
     else:
-        body_line = 180.0
+        body_line = 180.0             # skip form check if either side is missing
 
     if 0.0 < body_line < BODY_LINE_MIN_ANGLE:
         _pu_cur_rep_good = False
 
-    if elbow_angle > 0 and elbow_angle < ELBOW_DOWN_THRESHOLD and not _pu_is_down:
+    in_position = _is_pushup_position()
+
+    if in_position and elbow_angle > 0 and elbow_angle < ELBOW_DOWN_THRESHOLD and not _pu_is_down:
         _pu_is_down      = True
         _pu_cur_rep_good = True
 
-    elif elbow_angle > ELBOW_UP_THRESHOLD and _pu_is_down:
+    elif in_position and elbow_angle > ELBOW_UP_THRESHOLD and _pu_is_down:
         _pu_is_down     = False
         _pu_total_reps += 1
         if _pu_cur_rep_good:
